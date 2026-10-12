@@ -119,4 +119,4 @@ for series_id, cfg in INDICATOR_MAP.items():
         print(f"Error processing {series_id}: {e}")
 
 summary_df = pd.DataFrame(summary_data)
-print(summary_df.to_string(index=False))s
+print(summary_df.to_string(index=False))
