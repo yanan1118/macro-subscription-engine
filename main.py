@@ -17,13 +17,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 if not FRED_API_KEY:
     raise RuntimeError("FRED_API_KEY is not set")
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 OBS_START = "2000-01-01"
-CACHE_TTL = 3600
+CACHE_TTL = 3600      # 正常缓存 1 小时
+RETRY_AFTER = 300     # 有序列失败时，5 分钟后重试
+MAX_WORKERS = 4       # 降低被 FRED 限流的概率
 TOL = {"daily": 7, "weekly": 10, "monthly": 3}
 
 INDICATOR_MAP = {
@@ -47,12 +49,21 @@ INDICATOR_MAP = {
     "RRPONTSYD": {"name": "Overnight Reverse Repo", "type": "level", "freq": "daily"},
 }
 
+
+def log(*args):
+    # flush=True：确保 Railway 日志实时可见。
+    # 不要打印完整请求 URL 或 requests 原始异常文本（可能含 API key）
+    print(*args, flush=True)
+
+
 def clean(x, nd=2):
+    """NaN/inf/None -> None，避免 JSON 序列化失败"""
     try:
         x = float(x)
     except (TypeError, ValueError):
         return None
     return round(x, nd) if math.isfinite(x) else None
+
 
 def fetch_fred_series(series_id, retries=3):
     params = {"series_id": series_id, "api_key": FRED_API_KEY,
@@ -64,24 +75,34 @@ def fetch_fred_series(series_id, retries=3):
                 raise RuntimeError(f"{series_id}: HTTP {r.status_code}")
             r.raise_for_status()
             break
-        except requests.RequestException:
+        except requests.RequestException as e:
             if attempt == retries - 1:
-                raise RuntimeError(f"{series_id}: Fetch failed") from None
-            time.sleep(2 ** attempt)
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                raise RuntimeError(
+                    f"{series_id}: fetch failed ({type(e).__name__}, status={status})"
+                ) from None
+            time.sleep(2 ** attempt + 1)
+
     df = pd.DataFrame(r.json()["observations"])[["date", "value"]]
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["date"] = pd.to_datetime(df["date"])
-    
-    # 过滤掉未来日期的观测值，防止时间错乱
+
+    # 过滤未来日期的观测值
     now_date = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
     df = df[df["date"] <= now_date]
-    
-    return df.dropna().sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    df = df.dropna().sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError(f"{series_id}: no observations")
+    return df
+
 
 def lagged(s, months, tol_days):
+    """取 date - months 那天的值；找不到则返回 NaN，不错位"""
     target = s.index - pd.DateOffset(months=months)
     vals = s.reindex(target, method="ffill", tolerance=pd.Timedelta(days=tol_days)).values
     return pd.Series(vals, index=s.index)
+
 
 def process_price_index(df, freq="monthly"):
     tol = TOL[freq]
@@ -92,6 +113,7 @@ def process_price_index(df, freq="monthly"):
     out["acceleration"] = out["ann_3m"] - lagged(out["ann_3m"], 3, tol)
     return out
 
+
 def process_level_series(df, freq="daily"):
     tol = TOL[freq]
     s = df.set_index("date")["value"]
@@ -101,18 +123,29 @@ def process_level_series(df, freq="daily"):
     out["acceleration"] = out["change_3m"] - lagged(out["change_3m"], 3, tol)
     return out
 
+
 def pct_rank(s, years=20):
+    """最新值在过去 N 年中的分位数 (0-100)，仅用于展示当前位置"""
     s = s.dropna()
     if s.empty:
         return None
     w = s[s.index >= s.index[-1] - pd.DateOffset(years=years)]
     return clean((w <= w.iloc[-1]).mean() * 100, 0)
 
+
 def build_one(item):
     series_id, cfg = item
     base = {"series_id": series_id, "name": cfg["name"], "freq": cfg["freq"]}
+
+    # 第一步：抓取。失败则没有原始数据
     try:
         raw = fetch_fred_series(series_id)
+    except Exception as e:
+        log(f"[fetch] {series_id} failed: {e}")
+        return {**base, "error": str(e)}, None
+
+    # 第二步：处理。失败时仍然返回 raw，供衍生指标使用
+    try:
         base["latest_date"] = raw["date"].iloc[-1].strftime("%Y-%m-%d")
         if cfg["type"] == "price_index":
             p = process_price_index(raw, cfg["freq"])
@@ -120,7 +153,7 @@ def build_one(item):
             return {**base, "metric_type": "yoy_percent",
                     "level_or_yoy": clean(last["yoy"]),
                     "short_term": clean(last["ann_3m"]),
-                    "change_3m": clean(last["ann_3m"]),
+                    "change_3m": clean(last["ann_3m"]),   # 价格指数：3 个月年化
                     "acceleration": clean(last["acceleration"]),
                     "percentile": pct_rank(p["yoy"])}, raw
         p = process_level_series(raw, cfg["freq"])
@@ -133,9 +166,12 @@ def build_one(item):
                 "acceleration": clean(last["acceleration"]),
                 "percentile": pct_rank(p["value"])}, raw
     except Exception as e:
-        return {**base, "error": str(e)}, None
+        log(f"[process] {series_id} failed: {type(e).__name__}: {e}")
+        return {**base, "error": f"processing: {type(e).__name__}"}, raw
+
 
 def streak(diffs):
+    """末尾连续同向的期数：正数=连续上升，负数=连续下降"""
     n, d = 0, 0
     for x in reversed(list(diffs)):
         sgn = 1 if x > 0 else -1 if x < 0 else 0
@@ -144,13 +180,15 @@ def streak(diffs):
         d, n = sgn, n + 1
     return n * d
 
+
 def build_liquidity_trigger(raw):
+    """SOFR−IORB 10 日均值 + 准备金连续变动周数；阈值为暂定值，需历史校准"""
+    missing = [k for k in ("SOFR", "IORB", "WRBWFRBL") if k not in raw]
+    if missing:
+        log(f"[liquidity_trigger] missing series: {missing}")
+        return None, None
     try:
-        if not raw or "SOFR" not in raw or "IORB" not in raw or "WRBWFRBL" not in raw:
-            return None, None
         sofr, iorb, res = raw["SOFR"], raw["IORB"], raw["WRBWFRBL"]
-        if sofr.empty or iorb.empty or res.empty:
-            return None, None
         m = pd.merge_asof(
             sofr[["date", "value"]], iorb[["date", "value"]],
             on="date", direction="backward", suffixes=("_s", "_i")).dropna()
@@ -172,16 +210,20 @@ def build_liquidity_trigger(raw):
                 "avg_10d": clean(avg10, 1),
                 "short_term": None, "change_3m": None, "acceleration": None}
         trigger = {"spread_10d_avg_bp": clean(avg10, 1),
-                   "reserves_streak_weeks": weeks,
+                   "reserves_streak_weeks": weeks,   # 负数=连续下降周数
                    "status": status}
         return card, trigger
     except Exception as e:
-        print(f"[liquidity_trigger] failed: {type(e).__name__}: {e}")
+        log(f"[liquidity_trigger] failed: {type(e).__name__}: {e}")
         return None, None
 
+
 def build_term_premium_trigger(raw):
+    """10Y 3 个月变化 vs 期限溢价 / 盈亏平衡通胀的 3 个月变化（同一日期对齐）"""
     need = ("DGS10", "THREEFYTP10", "T10YIE")
-    if any(k not in raw for k in need):
+    missing = [k for k in need if k not in raw]
+    if missing:
+        log(f"[tp_trigger] missing series: {missing}")
         return None
     try:
         df = None
@@ -189,7 +231,7 @@ def build_term_premium_trigger(raw):
             s = raw[k].set_index("date")["value"].rename(k)
             df = s.to_frame() if df is None else df.join(s, how="inner")
         df = df.dropna()
-        if len(df) == 0:
+        if df.empty:
             return None
         last_date = df.index[-1]
         base_dates = df.index[df.index <= last_date - pd.DateOffset(months=3)]
@@ -199,18 +241,19 @@ def build_term_premium_trigger(raw):
         d10 = (l["DGS10"] - b["DGS10"]) * 100
         dtp = (l["THREEFYTP10"] - b["THREEFYTP10"]) * 100
         dbe = (l["T10YIE"] - b["T10YIE"]) * 100
-        falsified = d10 >= 25 and dtp <= 0 and dbe >= 15
+        falsified = d10 >= 25 and dtp <= 0 and dbe >= 15   # 暂定阈值
         return {"as_of": last_date.strftime("%Y-%m-%d"),
                 "d10y_3m_bp": clean(d10, 0),
                 "d_term_premium_3m_bp": clean(dtp, 0),
                 "d_breakeven_3m_bp": clean(dbe, 0),
                 "status": "falsified" if falsified else "not_triggered"}
     except Exception as e:
-        print(f"[tp_trigger] failed: {type(e).__name__}: {e}")
+        log(f"[tp_trigger] failed: {type(e).__name__}: {e}")
         return None
 
+
 def build_payload():
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         results = list(ex.map(build_one, INDICATOR_MAP.items()))
     data = [r[0] for r in results]
     raw = {sid: r[1] for sid, r in zip(INDICATOR_MAP, results) if r[1] is not None}
@@ -218,21 +261,25 @@ def build_payload():
     card, lq_trigger = build_liquidity_trigger(raw)
     if card:
         data.append(card)
-        
     tp_trigger = build_term_premium_trigger(raw)
 
+    failed = [d["series_id"] for d in data if "error" in d]
     return {
         "status": "success",
+        "partial": bool(failed),
+        "failed_series": failed,
         "updated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC"),
         "data": data,
         "triggers": {
             "liquidity_transmission": lq_trigger,
-            "term_premium_driver": tp_trigger
+            "term_premium_driver": tp_trigger,
         },
     }
 
+
 CACHE = {"ts": 0.0, "payload": None}
 LOCK = threading.Lock()
+
 
 def get_cached():
     with LOCK:
@@ -240,17 +287,51 @@ def get_cached():
             return CACHE["payload"]
         try:
             payload = build_payload()
-            CACHE.update(ts=time.time(), payload=payload)
+            old = CACHE["payload"]
+
+            # 新结果比旧结果差（失败更多）时，保留旧数据，5 分钟后再试
+            if old and len(payload["failed_series"]) > len(old.get("failed_series", [])):
+                log(f"[cache] new result worse ({len(payload['failed_series'])} failed); keeping previous")
+                CACHE["ts"] = time.time() - (CACHE_TTL - RETRY_AFTER)
+                return old
+
+            # 有序列失败时，缓存只保留约 5 分钟
+            offset = (CACHE_TTL - RETRY_AFTER) if payload["partial"] else 0
+            CACHE.update(ts=time.time() - offset, payload=payload)
+            if payload["partial"]:
+                log(f"[cache] partial result, failed: {payload['failed_series']}")
             return payload
-        except Exception:
+        except Exception as e:
+            log(f"[cache] refresh failed: {type(e).__name__}: {e}")
             if CACHE["payload"]:
                 return CACHE["payload"]
             raise
+
 
 @app.on_event("startup")
 def warm_cache():
     threading.Thread(target=get_cached, daemon=True).start()
 
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/api/minerva-macro")
 def get_macro_data():
     return get_cached()
+
+
+# ===== 临时排查接口：定位问题后请删除 =====
+@app.get("/api/debug")
+def debug():
+    p = get_cached()
+    return {
+        "key_len": len(FRED_API_KEY),   # 只显示长度，不显示 key
+        "updated_at": p["updated_at"],
+        "partial": p["partial"],
+        "ok_count": sum(1 for d in p["data"] if "error" not in d),
+        "failed": {d["series_id"]: d["error"] for d in p["data"] if "error" in d},
+        "triggers_present": {k: v is not None for k, v in p["triggers"].items()},
+    }
