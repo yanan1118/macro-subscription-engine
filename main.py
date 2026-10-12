@@ -3,8 +3,8 @@ import time
 import pandas as pd
 import requests
 
-# 1. 设置 API Key
-FRED_API_KEY = "C4526744E95B3CBC93C23E9746574C96"
+# 1. 设置 API Key 并强制转为小写，满足 FRED 官方要求
+FRED_API_KEY = "C4526744E95B3CBC93C23E9746574C96".strip().lower()
 if not FRED_API_KEY:
     raise RuntimeError("FRED_API_KEY is not configured.")
 
@@ -36,12 +36,11 @@ INDICATOR_MAP = {
 }
 
 def fetch_fred_series(series_id, retries=3):
-    params = {"series_id": series_id, "api_key": FRED_API_KEY.strip(), "file_type": "json"}
+    params = {"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json"}
     for attempt in range(retries):
         try:
             r = requests.get(BASE_URL, params=params, timeout=30)
             
-            # 如果状态码不是 200，把 FRED 返回的官方错误文本打印到日志中
             if r.status_code != 200:
                 print(f"[{series_id}] HTTP {r.status_code} Response: {r.text}")
                 if 400 <= r.status_code < 500 and r.status_code != 429:
@@ -120,4 +119,4 @@ for series_id, cfg in INDICATOR_MAP.items():
         print(f"Error processing {series_id}: {e}")
 
 summary_df = pd.DataFrame(summary_data)
-print(summary_df.to_string(index=False))
+print(summary_df.to_string(index=False))s
