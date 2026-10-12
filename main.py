@@ -51,13 +51,10 @@ INDICATOR_MAP = {
 
 
 def log(*args):
-    # flush=True：确保 Railway 日志实时可见。
-    # 不要打印完整请求 URL 或 requests 原始异常文本（可能含 API key）
     print(*args, flush=True)
 
 
 def clean(x, nd=2):
-    """NaN/inf/None -> None，避免 JSON 序列化失败"""
     try:
         x = float(x)
     except (TypeError, ValueError):
@@ -98,7 +95,6 @@ def fetch_fred_series(series_id, retries=3):
 
 
 def lagged(s, months, tol_days):
-    """取 date - months 那天的值；找不到则返回 NaN，不错位"""
     target = s.index - pd.DateOffset(months=months)
     vals = s.reindex(target, method="ffill", tolerance=pd.Timedelta(days=tol_days)).values
     return pd.Series(vals, index=s.index)
@@ -108,9 +104,12 @@ def process_price_index(df, freq="monthly"):
     tol = TOL[freq]
     s = df.set_index("date")["value"]
     out = pd.DataFrame({"value": s})
+    # 计算当月 YoY
     out["yoy"] = (s / lagged(s, 12, tol) - 1) * 100
+    # 核心修复：价格指数的 3 个月变化严格采用 Δ3M YoY = YoY_t - YoY_{t-3}
+    out["change_3m"] = out["yoy"] - lagged(out["yoy"], 3, tol)
     out["ann_3m"] = ((s / lagged(s, 3, tol)) ** 4 - 1) * 100
-    out["acceleration"] = out["ann_3m"] - lagged(out["ann_3m"], 3, tol)
+    out["acceleration"] = out["change_3m"] - lagged(out["change_3m"], 3, tol)
     return out
 
 
@@ -125,7 +124,6 @@ def process_level_series(df, freq="daily"):
 
 
 def pct_rank(s, years=20):
-    """最新值在过去 N 年中的分位数 (0-100)，仅用于展示当前位置"""
     s = s.dropna()
     if s.empty:
         return None
@@ -137,14 +135,12 @@ def build_one(item):
     series_id, cfg = item
     base = {"series_id": series_id, "name": cfg["name"], "freq": cfg["freq"]}
 
-    # 第一步：抓取。失败则没有原始数据
     try:
         raw = fetch_fred_series(series_id)
     except Exception as e:
         log(f"[fetch] {series_id} failed: {e}")
         return {**base, "error": str(e)}, None
 
-    # 第二步：处理。失败时仍然返回 raw，供衍生指标使用
     try:
         base["latest_date"] = raw["date"].iloc[-1].strftime("%Y-%m-%d")
         if cfg["type"] == "price_index":
@@ -153,7 +149,7 @@ def build_one(item):
             return {**base, "metric_type": "yoy_percent",
                     "level_or_yoy": clean(last["yoy"]),
                     "short_term": clean(last["ann_3m"]),
-                    "change_3m": clean(last["ann_3m"]),   # 价格指数：3 个月年化
+                    "change_3m": clean(last["change_3m"]),   # 价格指数：3个月 YoY 变动 (pts)
                     "acceleration": clean(last["acceleration"]),
                     "percentile": pct_rank(p["yoy"])}, raw
         p = process_level_series(raw, cfg["freq"])
@@ -171,7 +167,6 @@ def build_one(item):
 
 
 def streak(diffs):
-    """末尾连续同向的期数：正数=连续上升，负数=连续下降"""
     n, d = 0, 0
     for x in reversed(list(diffs)):
         sgn = 1 if x > 0 else -1 if x < 0 else 0
@@ -182,7 +177,6 @@ def streak(diffs):
 
 
 def build_liquidity_trigger(raw):
-    """SOFR−IORB 10 日均值 + 准备金连续变动周数；阈值为暂定值，需历史校准"""
     missing = [k for k in ("SOFR", "IORB", "WRBWFRBL") if k not in raw]
     if missing:
         log(f"[liquidity_trigger] missing series: {missing}")
@@ -210,7 +204,7 @@ def build_liquidity_trigger(raw):
                 "avg_10d": clean(avg10, 1),
                 "short_term": None, "change_3m": None, "acceleration": None}
         trigger = {"spread_10d_avg_bp": clean(avg10, 1),
-                   "reserves_streak_weeks": weeks,   # 负数=连续下降周数
+                   "reserves_streak_weeks": weeks,
                    "status": status}
         return card, trigger
     except Exception as e:
@@ -219,7 +213,6 @@ def build_liquidity_trigger(raw):
 
 
 def build_term_premium_trigger(raw):
-    """10Y 3 个月变化 vs 期限溢价 / 盈亏平衡通胀的 3 个月变化（同一日期对齐）"""
     need = ("DGS10", "THREEFYTP10", "T10YIE")
     missing = [k for k in need if k not in raw]
     if missing:
@@ -241,7 +234,7 @@ def build_term_premium_trigger(raw):
         d10 = (l["DGS10"] - b["DGS10"]) * 100
         dtp = (l["THREEFYTP10"] - b["THREEFYTP10"]) * 100
         dbe = (l["T10YIE"] - b["T10YIE"]) * 100
-        falsified = d10 >= 25 and dtp <= 0 and dbe >= 15   # 暂定阈值
+        falsified = d10 >= 25 and dtp <= 0 and dbe >= 15
         return {"as_of": last_date.strftime("%Y-%m-%d"),
                 "d10y_3m_bp": clean(d10, 0),
                 "d_term_premium_3m_bp": clean(dtp, 0),
@@ -289,17 +282,13 @@ def get_cached():
             payload = build_payload()
             old = CACHE["payload"]
 
-            # 新结果比旧结果差（失败更多）时，保留旧数据，5 分钟后再试
             if old and len(payload["failed_series"]) > len(old.get("failed_series", [])):
-                log(f"[cache] new result worse ({len(payload['failed_series'])} failed); keeping previous")
+                log(f"[cache] new result worse; keeping previous")
                 CACHE["ts"] = time.time() - (CACHE_TTL - RETRY_AFTER)
                 return old
 
-            # 有序列失败时，缓存只保留约 5 分钟
             offset = (CACHE_TTL - RETRY_AFTER) if payload["partial"] else 0
             CACHE.update(ts=time.time() - offset, payload=payload)
-            if payload["partial"]:
-                log(f"[cache] partial result, failed: {payload['failed_series']}")
             return payload
         except Exception as e:
             log(f"[cache] refresh failed: {type(e).__name__}: {e}")
@@ -321,17 +310,3 @@ def health():
 @app.get("/api/minerva-macro")
 def get_macro_data():
     return get_cached()
-
-
-# ===== 临时排查接口：定位问题后请删除 =====
-@app.get("/api/debug")
-def debug():
-    p = get_cached()
-    return {
-        "key_len": len(FRED_API_KEY),   # 只显示长度，不显示 key
-        "updated_at": p["updated_at"],
-        "partial": p["partial"],
-        "ok_count": sum(1 for d in p["data"] if "error" not in d),
-        "failed": {d["series_id"]: d["error"] for d in p["data"] if "error" in d},
-        "triggers_present": {k: v is not None for k, v in p["triggers"].items()},
-    }
