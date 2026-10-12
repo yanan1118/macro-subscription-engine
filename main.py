@@ -36,12 +36,17 @@ INDICATOR_MAP = {
 }
 
 def fetch_fred_series(series_id, retries=3):
-    params = {"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json"}
+    params = {"series_id": series_id, "api_key": FRED_API_KEY.strip(), "file_type": "json"}
     for attempt in range(retries):
         try:
             r = requests.get(BASE_URL, params=params, timeout=30)
-            if 400 <= r.status_code < 500 and r.status_code != 429:
-                raise RuntimeError(f"{series_id}: HTTP {r.status_code} Client Error")
+            
+            # 如果状态码不是 200，把 FRED 返回的官方错误文本打印到日志中
+            if r.status_code != 200:
+                print(f"[{series_id}] HTTP {r.status_code} Response: {r.text}")
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    raise RuntimeError(f"{series_id}: HTTP {r.status_code} Client Error")
+            
             r.raise_for_status()
             break
         except requests.RequestException as e:
@@ -50,7 +55,11 @@ def fetch_fred_series(series_id, retries=3):
                 raise RuntimeError(f"{series_id}: Fetch failed (HTTP Status: {status_code})") from None
             time.sleep(2**attempt)
 
-    df = pd.DataFrame(r.json()["observations"])[["date", "value"]]
+    data = r.json()
+    if "observations" not in data:
+        raise RuntimeError(f"{series_id} API Error format: {data}")
+
+    df = pd.DataFrame(data["observations"])[["date", "value"]]
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["date"] = pd.to_datetime(df["date"])
     df = df.dropna().sort_values("date").drop_duplicates("date")
