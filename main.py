@@ -24,7 +24,10 @@ INDICATOR_MAP = {
     "DGS10": {"name": "10Y Treasury Yield", "type": "level", "freq": "daily"},
     "DGS2": {"name": "2Y Treasury Yield", "type": "level", "freq": "daily"},
     "DFII10": {"name": "10Y Real Yield (TIPS)", "type": "level", "freq": "daily"},
+    "T10YIE": {"name": "10Y Breakeven Inflation Rate", "type": "level", "freq": "daily"},
+    "THREEFYTP10": {"name": "10Y Treasury Term Premium", "type": "level", "freq": "daily"},
     "SOFR": {"name": "SOFR Rate", "type": "level", "freq": "daily"},
+    "IORB": {"name": "Interest Rate on Reserve Balances", "type": "level", "freq": "daily"},
     "NFCI": {"name": "Financial Conditions Index", "type": "level", "freq": "weekly"},
     "CPILFESL": {"name": "Core CPI Index", "type": "price_index", "freq": "monthly"},
     "PCEPILFE": {"name": "Core PCE Index", "type": "price_index", "freq": "monthly"},
@@ -46,7 +49,7 @@ def fetch_fred_series(series_id, retries=3):
             if r.status_code != 200:
                 if 400 <= r.status_code < 500 and r.status_code != 429:
                     raise RuntimeError(f"{series_id}: HTTP {r.status_code}")
-            r.raise_for_status()
+                r.raise_for_status()
             break
         except requests.RequestException:
             if attempt == retries - 1:
@@ -85,9 +88,13 @@ def process_level_series(df, freq="daily"):
 @app.get("/api/minerva-macro")
 def get_macro_data():
     summary_data = []
+    raw_cache = {} # 用于暂存原始数据以计算扩展指标（如价差）
+
     for series_id, cfg in INDICATOR_MAP.items():
         try:
             raw_df = fetch_fred_series(series_id)
+            raw_cache[series_id] = raw_df
+            
             if cfg["type"] == "price_index":
                 processed = process_price_index(raw_df, freq=cfg["freq"])
                 latest = processed.iloc[-1]
@@ -115,6 +122,26 @@ def get_macro_data():
         except Exception as e:
             summary_data.append({"series_id": series_id, "name": cfg["name"], "error": str(e)})
             
+    # 自动计算衍生指标：SOFR - IORB Spread (单位: bp)
+    try:
+        if "SOFR" in raw_cache and "IORB" in raw_cache:
+            sofr_latest = raw_cache["SOFR"].iloc[-1]["value"]
+            iorb_latest = raw_cache["IORB"].iloc[-1]["value"]
+            spread_bp = (float(sofr_latest) - float(iorb_latest)) * 100.0
+            latest_date = raw_cache["SOFR"].iloc[-1]["date"].strftime("%Y-%m-%d")
+            
+            summary_data.append({
+                "series_id": "SOFR_IORB",
+                "name": "SOFR - IORB Spread",
+                "latest_date": latest_date,
+                "level_or_yoy": round(spread_bp, 1),
+                "metric_type": "absolute_level",
+                "short_term": 0.0,
+                "acceleration": 0.0
+            })
+    except Exception:
+        pass # 若计算失败则静默跳过，不影响主流程
+
     return {
         "status": "success",
         "updated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC"),
