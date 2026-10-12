@@ -17,13 +17,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 if not FRED_API_KEY:
     raise RuntimeError("FRED_API_KEY is not set")
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 OBS_START = "2000-01-01"   # 够算 20 年分位，也避免每次拉全历史
-CACHE_TTL = 3600           # 秒
+CACHE_TTL = 3600           # 正常缓存 1 小时
+RETRY_AFTER = 300          # 有序列失败时，5 分钟后重试
+MAX_WORKERS = 4            # 并行度，降低被 FRED 限流的概率
 TOL = {"daily": 7, "weekly": 10, "monthly": 3}
 
 INDICATOR_MAP = {
@@ -48,6 +50,12 @@ INDICATOR_MAP = {
 }
 
 
+def log(*args):
+    # flush=True：确保 Railway 日志能实时看到。
+    # 注意：不要打印完整请求 URL 或原始 requests 异常文本（可能含 API key）
+    print(*args, flush=True)
+
+
 def clean(x, nd=2):
     """NaN/inf/None -> None，避免 JSON 序列化失败"""
     try:
@@ -63,21 +71,29 @@ def fetch_fred_series(series_id, retries=3):
     for attempt in range(retries):
         try:
             r = requests.get(BASE_URL, params=params, timeout=30)
+            # 4xx（429 除外）重试没有意义，直接报错；状态码本身不含 key
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 raise RuntimeError(f"{series_id}: HTTP {r.status_code}")
             r.raise_for_status()
             break
-        except requests.RequestException:
+        except requests.RequestException as e:
             if attempt == retries - 1:
-                raise RuntimeError(f"{series_id}: Fetch failed") from None
-            time.sleep(2 ** attempt)
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                raise RuntimeError(
+                    f"{series_id}: fetch failed ({type(e).__name__}, status={status})"
+                ) from None
+            time.sleep(2 ** attempt + 1)
     df = pd.DataFrame(r.json()["observations"])[["date", "value"]]
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["date"] = pd.to_datetime(df["date"])
-    return df.dropna().sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = df.dropna().sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError(f"{series_id}: no observations")
+    return df
 
 
 def lagged(s, months, tol_days):
+    """取 date - months 那天的值；找不到则返回 NaN，不错位"""
     target = s.index - pd.DateOffset(months=months)
     vals = s.reindex(target, method="ffill", tolerance=pd.Timedelta(days=tol_days)).values
     return pd.Series(vals, index=s.index)
@@ -104,7 +120,7 @@ def process_level_series(df, freq="daily"):
 
 
 def pct_rank(s, years=20):
-    """最新值在过去 N 年中的分位数 (0-100)，仅用于展示"""
+    """最新值在过去 N 年中的分位数 (0-100)，仅用于展示当前位置"""
     s = s.dropna()
     if s.empty:
         return None
@@ -115,8 +131,16 @@ def pct_rank(s, years=20):
 def build_one(item):
     series_id, cfg = item
     base = {"series_id": series_id, "name": cfg["name"], "freq": cfg["freq"]}
+
+    # 第一步：抓取。失败则没有原始数据
     try:
         raw = fetch_fred_series(series_id)
+    except Exception as e:
+        log(f"[fetch] {series_id} failed: {e}")
+        return {**base, "error": str(e)}, None
+
+    # 第二步：处理。失败时仍然返回 raw，供衍生指标使用
+    try:
         base["latest_date"] = raw["date"].iloc[-1].strftime("%Y-%m-%d")
         if cfg["type"] == "price_index":
             p = process_price_index(raw, cfg["freq"])
@@ -136,11 +160,12 @@ def build_one(item):
                 "acceleration": clean(last["acceleration"]),
                 "percentile": pct_rank(p["value"])}, raw
     except Exception as e:
-        return {**base, "error": str(e)}, None
+        log(f"[process] {series_id} failed: {type(e).__name__}: {e}")
+        return {**base, "error": f"processing: {type(e).__name__}"}, raw
 
 
 def streak(diffs):
-    """末尾连续同向的周数：正数=连续上升，负数=连续下降"""
+    """末尾连续同向的期数：正数=连续上升，负数=连续下降"""
     n, d = 0, 0
     for x in reversed(list(diffs)):
         sgn = 1 if x > 0 else -1 if x < 0 else 0
@@ -151,7 +176,12 @@ def streak(diffs):
 
 
 def build_liquidity_trigger(raw):
-    """SOFR-IORB 10 日均值 + 准备金连续变动周数 -> 触发状态"""
+    """SOFR−IORB 的 10 日均值 + 准备金连续变动周数 -> 触发状态
+    阈值为暂定值（provisional），需用历史数据校准"""
+    missing = [k for k in ("SOFR", "IORB", "WRBWFRBL") if k not in raw]
+    if missing:
+        log(f"[liquidity_trigger] missing series: {missing}")
+        return None, None
     try:
         sofr, iorb, res = raw["SOFR"], raw["IORB"], raw["WRBWFRBL"]
         m = pd.merge_asof(
@@ -179,12 +209,12 @@ def build_liquidity_trigger(raw):
                    "status": status}
         return card, trigger
     except Exception as e:
-        print(f"[liquidity_trigger] failed: {type(e).__name__}: {e}")
+        log(f"[liquidity_trigger] failed: {type(e).__name__}: {e}")
         return None, None
 
 
 def build_payload():
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         results = list(ex.map(build_one, INDICATOR_MAP.items()))
     data = [r[0] for r in results]
     raw = {sid: r[1] for sid, r in zip(INDICATOR_MAP, results) if r[1] is not None}
@@ -192,8 +222,12 @@ def build_payload():
     card, trigger = build_liquidity_trigger(raw)
     if card:
         data.append(card)
+
+    failed = [d["series_id"] for d in data if "error" in d]
     return {
         "status": "success",
+        "partial": bool(failed),
+        "failed_series": failed,
         "updated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC"),
         "data": data,
         "triggers": {"liquidity_transmission": trigger},
@@ -210,9 +244,14 @@ def get_cached():
             return CACHE["payload"]
         try:
             payload = build_payload()
-            CACHE.update(ts=time.time(), payload=payload)
+            # 有序列失败时，把时间戳往前拨，约 5 分钟后自动重试
+            offset = 0 if not payload["partial"] else CACHE_TTL - RETRY_AFTER
+            CACHE.update(ts=time.time() - offset, payload=payload)
+            if payload["partial"]:
+                log(f"[cache] partial result, failed: {payload['failed_series']}")
             return payload
-        except Exception:
+        except Exception as e:
+            log(f"[cache] refresh failed: {type(e).__name__}: {e}")
             if CACHE["payload"]:       # 刷新失败时回退到旧缓存
                 return CACHE["payload"]
             raise
@@ -221,6 +260,11 @@ def get_cached():
 @app.on_event("startup")
 def warm_cache():
     threading.Thread(target=get_cached, daemon=True).start()
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.get("/api/minerva-macro")
