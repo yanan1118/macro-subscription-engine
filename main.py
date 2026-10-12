@@ -4,7 +4,7 @@ import pandas as pd
 import requests
 
 # 1. 设置 API Key
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "C4526744E95B3CBC93C23E9746574C96")
+FRED_API_KEY = "C4526744E95B3CBC93C23E9746574C96"
 if not FRED_API_KEY:
     raise RuntimeError("FRED_API_KEY is not configured.")
 
