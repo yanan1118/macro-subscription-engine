@@ -18,7 +18,7 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
-app.include_router(ai_capital_router)s
+app.include_router(ai_capital_router)
 
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 if not FRED_API_KEY:
