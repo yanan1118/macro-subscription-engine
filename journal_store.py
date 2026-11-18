@@ -175,7 +175,7 @@ def run_once(store, jid, now=None, **fetchers):
     draft, report = build_journal_draft(
         old, cf_fetcher=fetchers.get("cf_fetcher"), fred_fetch=fetchers.get("fred_fetch"),
         list_filings=fetchers.get("list_filings"), get_text=fetchers.get("get_text"), now=now)
-    board = status_board(draft, today)
+    board = status_board(draft, today, fred=report.pop("fred_current", None))
     draft["status_board"] = board
     if report["snapshot"] == "appended":
         draft["snapshots"][-1]["status_board"] = board        # 随快照冻结
