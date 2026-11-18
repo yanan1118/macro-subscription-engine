@@ -122,6 +122,22 @@ def company_quarter(cf, cfg, cal_q, as_of):
         out[k] = _metric_pit(cf, tags, e.isoformat(), as_of)
     if out["capex"] is None or out["ocf"] is None:
         return None
+    if out["debt_issued"] is None:
+        out["debt_tag_candidates"] = debt_tag_candidates(cf, e.isoformat(), as_of)
+    return out
+
+
+DEBT_TAG_RE = re.compile(r"^ProceedsFrom.*(Debt|Notes|Borrowing)")
+
+
+def debt_tag_candidates(cf, end_s, as_of):
+    """抓不到发债时，列出该公司本季度实际存在的候选标签，方便下次把正确标签加进 TAGS"""
+    out = {}
+    for tag in cf.get("facts", {}).get("us-gaap", {}):
+        if DEBT_TAG_RE.match(tag) and tag not in TAGS["debt_issued"]:
+            r = _metric_pit(cf, [tag], end_s, as_of)
+            if r:
+                out[tag] = r["value_b"]
     return out
 
 
@@ -148,7 +164,9 @@ def aggregate(per_co):
                             "capex_b": v["capex"]["value_b"], "ocf_b": v["ocf"]["value_b"],
                             "ocf_to_capex": round(ratios[t], 4) if t in ratios else None,
                             "debt_issued_b": v["debt_issued"]["value_b"] if v["debt_issued"] else None,
-                            "accn": v["capex"]["accn"]} for t, v in ok.items()},
+                            "accn": v["capex"]["accn"],
+                            **({"debt_tag_candidates": v["debt_tag_candidates"]}
+                               if "debt_tag_candidates" in v else {})} for t, v in ok.items()},
     }
 
 
