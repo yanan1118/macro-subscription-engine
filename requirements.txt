@@ -4,3 +4,5 @@ requests
 python-dotenv
 fastapi 
 uvicorn
+sqlalchemy 
+pymysql
