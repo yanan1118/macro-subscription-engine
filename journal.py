@@ -202,11 +202,17 @@ def fred_block(fred_fetch, today):
         try:
             obs = [o for o in fred_fetch(sid) if o[0] <= today.isoformat()]
             d, v = obs[-1]
-            ld = _d(d)
-            target = date(ld.year - 1, ld.month, min(ld.day, 28))
-            past = [o for o in obs if _d(o[0]) <= target and (target - _d(o[0])).days <= 40]
-            yoy = round(v / past[-1][1] - 1, 4) if past and past[-1][1] else None
-            out[sid] = {"name": name, "latest_date": d, "value": v, "yoy": yoy}
+
+            def yoy_at(i):
+                di, vi = obs[i]
+                ld = _d(di)
+                target = date(ld.year - 1, ld.month, min(ld.day, 28))
+                past = [o for o in obs[:i] if _d(o[0]) <= target and (target - _d(o[0])).days <= 40]
+                return round(vi / past[-1][1] - 1, 4) if past and past[-1][1] else None
+
+            hist = [[obs[i][0], yoy_at(i)] for i in range(max(0, len(obs) - 6), len(obs))]
+            out[sid] = {"name": name, "latest_date": d, "value": v, "yoy": hist[-1][1],
+                        "yoy_history": hist}   # 最近 6 期同比，供 H3 证伪规则使用
         except Exception as e:
             failed.append(sid)
             out[sid] = {"name": name, "error": f"{type(e).__name__}"}
