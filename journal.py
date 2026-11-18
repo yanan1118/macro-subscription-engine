@@ -342,6 +342,7 @@ def build_journal_draft(journal, cf_fetcher=None, fred_fetch=None,
         })
         report["snapshot"] = "appended"
     report["fred_failed"] = fred_failed
+    report["fred_current"] = fred   # 供规则引擎使用最新数据（不一定进快照）
     draft["auto_update"] = {"last_run_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "tampered_predictions": report["tampered_predictions"]}
     return draft, report
