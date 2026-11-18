@@ -46,12 +46,14 @@ def check_h2(doc):
 H3_SERIES = ("PCU335311335311", "PCU335313335313")   # 变压器 PPI、开关设备 PPI
 
 
-def check_h3(doc, months=3):
-    """H3 证伪：变压器 PPI 与开关设备 PPI 同比均 ≤ 0，且连续 3 个月"""
-    snaps = doc.get("snapshots", [])
-    if not snaps:
-        return {"status": "insufficient_data", "detail": "no snapshot"}
-    fred = snaps[-1].get("h3", {}).get("fred", {})
+def check_h3(doc, months=3, fred=None):
+    """H3 证伪：变压器 PPI 与开关设备 PPI 同比均 ≤ 0，且连续 3 个月。
+    优先用本次运行抓到的最新 FRED 数据，没有时用最后一条快照"""
+    if fred is None:
+        snaps = doc.get("snapshots", [])
+        if not snaps:
+            return {"status": "insufficient_data", "detail": "no snapshot"}
+        fred = snaps[-1].get("h3", {}).get("fred", {})
     detail, all_neg = {}, True
     for sid in H3_SERIES:
         hist = [y for _, y in (fred.get(sid, {}).get("yoy_history") or []) if y is not None]
@@ -67,8 +69,9 @@ def check_h1(doc):
     return {"status": "manual", "detail": "guidance extraction not automated yet"}
 
 
-def status_board(doc, today):
-    return {"as_of": today.isoformat(), "H1": check_h1(doc), "H2": check_h2(doc), "H3": check_h3(doc)}
+def status_board(doc, today, fred=None):
+    return {"as_of": today.isoformat(), "H1": check_h1(doc), "H2": check_h2(doc),
+            "H3": check_h3(doc, fred=fred)}
 
 
 # ---------------------------------------------------------------- 预测判定
