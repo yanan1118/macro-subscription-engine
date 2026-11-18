@@ -9,6 +9,7 @@ import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ai_capital import router as ai_capital_router
+from journal import router as journal_router
 
 
 app = FastAPI()
@@ -19,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(ai_capital_router)
+app.include_router(journal_router)
 
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 if not FRED_API_KEY:
