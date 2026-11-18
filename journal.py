@@ -306,7 +306,11 @@ def build_journal_draft(journal, cf_fetcher=None, fred_fetch=None,
                           if isinstance(r, list) and r)
     key = f"{fin_now.get('calendar_quarter')}|{fred_key}|{filing_key}"
     snaps = draft.setdefault("snapshots", [])
-    if not snaps or snaps[-1].get("data_key") != key:
+    filing_errors = [t for t, r in filings.items() if not isinstance(r, list)]
+    if report["errors"] or filing_errors or not fin_now.get("complete"):
+        # 快照只追加、永不删除，所以数据不完整时宁可不写
+        report["snapshot"] = f"skipped - incomplete data ({sorted(set(report['errors']) | set(filing_errors))})"
+    elif not snaps or snaps[-1].get("data_key") != key:
         snaps.append({
             "as_of": today.isoformat(), "data_key": key, "status": "pending",
             "financials": fin_now,
