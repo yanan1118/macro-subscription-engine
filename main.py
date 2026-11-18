@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ai_capital import router as ai_capital_router
 from journal import router as journal_router
+from journal_store import router as journal_store_router, start_scheduler
 
 
 app = FastAPI()
@@ -21,6 +22,7 @@ app.add_middleware(
 )
 app.include_router(ai_capital_router)
 app.include_router(journal_router)
+app.include_router(journal_store_router)
 
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 if not FRED_API_KEY:
@@ -305,6 +307,7 @@ def get_cached():
 @app.on_event("startup")
 def warm_cache():
     threading.Thread(target=get_cached, daemon=True).start()
+    start_scheduler()
 
 
 @app.get("/health")
