@@ -25,6 +25,8 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 
 from journal import build_journal_draft, verify_predictions
 from journal_rules import evaluate_due_predictions, status_board
+import journal_ai as AI
+from journal import DEMAND
 
 LANGS = ("zh", "en", "fr")
 
@@ -128,6 +130,10 @@ def validate_update(old, new):
         o, n = old.get(key, []), new.get(key, [])
         if n[:len(o)] != o:
             errs.append(f"{key}: existing entries were modified or removed (append only)")
+    og, ng = old.get("guidance_log", []), new.get("guidance_log", [])
+    strip = lambda e: {k: v for k, v in e.items() if k not in ("status", "verified_at")}
+    if len(ng) < len(og) or [strip(e) for e in ng[:len(og)]] != [strip(e) for e in og]:
+        errs.append("guidance_log: existing entries were modified or removed (append only)")
     _locked_leaves(old.get("baseline", {}), new.get("baseline", {}), "baseline", errs,
                    skip=("status",))   # status 允许 pending -> verified
     return errs
@@ -175,6 +181,14 @@ def run_once(store, jid, now=None, **fetchers):
     draft, report = build_journal_draft(
         old, cf_fetcher=fetchers.get("cf_fetcher"), fred_fetch=fetchers.get("fred_fetch"),
         list_filings=fetchers.get("list_filings"), get_text=fetchers.get("get_text"), now=now)
+    llm = fetchers.get("llm") or (AI.claude_json if AI.ai_enabled() else None)
+    if llm:
+        try:
+            report["guidance"] = AI.update_guidance(
+                draft, DEMAND, llm=llm, list_releases=fetchers.get("list_releases"),
+                get_release=fetchers.get("get_release"), now=now)
+        except Exception as e:
+            report["guidance"] = {"error": f"{type(e).__name__}: {e}"}
     board = status_board(draft, today, fred=report.pop("fred_current", None))
     draft["status_board"] = board
     if report["snapshot"] == "appended":
@@ -182,6 +196,19 @@ def run_once(store, jid, now=None, **fetchers):
     report["evaluated"] = evaluate_due_predictions(
         draft, today, cf_fetcher=fetchers.get("cf_fetcher"),
         price_fetch=fetchers.get("price_fetch"), now=now)
+    if llm:
+        try:
+            report["translation"] = AI.translate_missing(draft, llm=llm, now=now)
+        except Exception as e:
+            report["translation"] = {"error": f"{type(e).__name__}: {e}"}
+        trig = AI.review_triggers(old, draft, report)
+        if trig:
+            try:
+                report["review_draft"] = AI.draft_review(old, draft, trig, llm=llm, now=now)["id"]
+            except Exception as e:
+                report["review_draft"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        report["ai"] = "disabled (ANTHROPIC_API_KEY not set)"
     errs = validate_update(old, draft)
     if errs:   # 程序自己的改动也要过守卫；不通过就不保存
         report["saved"] = False
@@ -354,5 +381,119 @@ try:
         s.save(jid, new, "manual")
         return _PAGE.format(jid=html.escape(jid), token=html.escape(token), msg='<p class="ok">已保存 / Saved</p>',
                             doc=html.escape(json.dumps(new, ensure_ascii=False, indent=2)))
+
+    # ---- AI 工作台：批准 Review 草稿、核验 CapEx 指引、粘贴电话会文字
+    _AI_CSS = """<style>body{font:14px -apple-system,sans-serif;max-width:1100px;margin:24px auto;color:#24292e;padding:0 16px}
+h2{border-bottom:2px solid #2c3e50;padding-bottom:6px;margin-top:34px}.box{border:1px solid #d0d7de;border-radius:8px;padding:14px;margin:12px 0}
+textarea{width:100%;font:13px sans-serif;box-sizing:border-box}label{font-size:12px;color:#57606a;display:block;margin-top:8px}
+table{border-collapse:collapse;width:100%;font-size:12px}td,th{border-bottom:1px solid #eaecef;padding:6px;text-align:left;vertical-align:top}
+.muted{color:#6a737d;font-size:12px}.ok{color:#1a7f37}.err{color:#cf222e;white-space:pre-wrap}button{margin:8px 8px 0 0;padding:6px 14px}
+.tag{font-size:11px;background:#eaeef2;border-radius:10px;padding:1px 8px}</style>"""
+
+    def _ai_page(jid, token, doc, msg=""):
+        e = html.escape
+        hidden = f'<input type="hidden" name="token" value="{e(token)}"><input type="hidden" name="jid" value="{e(jid)}">'
+        o = [f"<!doctype html><meta charset='utf-8'><title>Journal AI {e(jid)}</title>{_AI_CSS}",
+             f"<h1>Journal {e(jid)} · AI 工作台</h1>{msg}",
+             f"<p class='muted'>模型：{e(AI.model_name())} · API：{'已启用' if AI.ai_enabled() else '未设置 ANTHROPIC_API_KEY'}</p>"]
+        drafts = [d for d in doc.get("review_drafts", []) if d.get("status") == "draft"]
+        o.append(f"<h2>Review 草稿（{len(drafts)} 条待处理）</h2>")
+        if not drafts:
+            o.append("<p class='muted'>暂无待处理草稿。有新数据、状态变化或预测判定时会自动生成。</p>")
+        for d in drafts:
+            o.append(f"""<form method="post" class="box">{hidden}<input type="hidden" name="draft_id" value="{e(d['id'])}">
+<b>{e(d['id'])}</b> <span class="muted">{e(d['created_at'])} · 触发：{e(', '.join(d.get('triggers', [])))}</span>
+<label>中文（原文，发布时以此为准）</label><textarea name="zh" rows="4">{e(d['zh'])}</textarea>
+<label>English</label><textarea name="en" rows="4">{e(d['en'])}</textarea>
+<label>Français</label><textarea name="fr" rows="4">{e(d['fr'])}</textarea>
+<p class="muted">依据：{e(', '.join(d.get('basis', [])))}</p>
+<button name="action" value="approve">批准并发布</button><button name="action" value="reject">拒绝</button></form>""")
+        log = doc.get("guidance_log", [])
+        o.append(f"<h2>CapEx 指引记录（H1，共 {len(log)} 份文件）</h2><table><tr><th>公司</th><th>来源</th><th>提取结果</th><th>状态</th></tr>")
+        for g in reversed(log):
+            src = g.get("source", {})
+            link = f"<a href='{e(src['url'])}' target='_blank'>{e(src.get('label', ''))}</a>" if src.get("url") else e(src.get("label", ""))
+            if g.get("guidance_found"):
+                rows = []
+                for st in g.get("statements", []):
+                    num = (f"${st['low_usd_b']}–{st['high_usd_b']}B" if st.get("low_usd_b") is not None
+                           else (f"{st['growth_pct']}%" if st.get("growth_pct") is not None else st.get("guidance_type")))
+                    rows.append(f"<b>{e(st.get('period_covered'))}</b> {e(num)} · {e(st.get('basis'))} · "
+                                f"{e(st.get('direction_stated'))} / {e(st.get('reason_category'))}<br>"
+                                f"<span class='muted'>“{e(st.get('quote'))}”</span>")
+                res = "<br>".join(rows)
+            else:
+                res = f"<span class='muted'>未发现指引 · {e(g.get('notes', ''))}</span>"
+            btn = (f"<form method='post' style='margin:0'>{hidden}<input type='hidden' name='gid' value='{e(g['id'])}'>"
+                   f"<button name='action' value='verify_guidance'>核验无误</button></form>") if g.get("status") == "pending" and g.get("guidance_found") else ""
+            o.append(f"<tr><td><b>{e(g['ticker'])}</b></td><td>{link}<br><span class='muted'>{e(src.get('date', ''))}</span></td>"
+                     f"<td>{res}</td><td><span class='tag'>{e(g.get('status'))}</span>{btn}</td></tr>")
+        o.append("</table>")
+        o.append(f"""<h2>粘贴电话会文字 / CFO 发言</h2><p class="muted">MSFT、GOOGL、AMZN、ORCL 的 CapEx 指引多在电话会上给出，新闻稿里没有。
+把相关段落粘贴到这里，Claude 会按同样规则提取。</p>
+<form method="post" class="box">{hidden}<label>公司</label><select name="ticker">{''.join(f'<option>{t}</option>' for t in DEMAND)}</select>
+<label>来源说明（例：Q3 FY2027 earnings call, CFO remarks）</label><input name="label" style="width:100%">
+<label>日期（YYYY-MM-DD）</label><input name="date" placeholder="2026-10-29">
+<label>文字</label><textarea name="text" rows="10"></textarea>
+<button name="action" value="add_guidance">提取并加入</button></form>""")
+        rej = {k: v for k, v in (doc.get("i18n_rejected") or {}).items() if v >= 3}
+        if rej:
+            o.append(f"<h2>需要手工翻译</h2><p class='err'>以下内容自动翻译多次未通过数字核对，请在编辑页的 i18n 里手工填写：{e(', '.join(rej))}</p>")
+        o.append(f"<p class='muted'><a href='/admin/journal/edit?token={e(token)}&jid={e(jid)}'>原始 JSON 编辑页</a></p>")
+        return "".join(o)
+
+    @router.get("/admin/journal/ai", response_class=HTMLResponse)
+    def journal_ai_page(token: str = "", jid: str = "J-001"):
+        _check_token(token)
+        d = _need_store().get(jid)
+        if d is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return _ai_page(jid, token, d)
+
+    @router.post("/admin/journal/ai", response_class=HTMLResponse)
+    async def journal_ai_action(request: Request):
+        form = {k: v[0] for k, v in parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True).items()}
+        token, jid, action = form.get("token", ""), form.get("jid", "J-001"), form.get("action", "")
+        _check_token(token)
+        s = _need_store()
+        old = s.get(jid)
+        if old is None:
+            raise HTTPException(status_code=404, detail="not found")
+        new = copy.deepcopy(old)
+        today = datetime.now(timezone.utc).date().isoformat()
+        try:
+            if action == "approve":
+                if not form.get("zh", "").strip():
+                    raise ValueError("中文内容不能为空")
+                AI.approve_draft(new, form["draft_id"], form["zh"].strip(), form.get("en", "").strip(),
+                                 form.get("fr", "").strip(), "Yanan", today)
+                msg = "已批准并发布到复盘记录"
+            elif action == "reject":
+                AI.reject_draft(new, form["draft_id"], today)
+                msg = "已拒绝"
+            elif action == "verify_guidance":
+                g = next(x for x in new.get("guidance_log", []) if x["id"] == form.get("gid"))
+                g["status"], g["verified_at"] = "verified", today
+                msg = "已标记为核验无误"
+            elif action == "add_guidance":
+                if form.get("ticker") not in DEMAND or len(form.get("text", "")) < 50:
+                    raise ValueError("请选择公司并粘贴足够的文字")
+                if not AI.ai_enabled():
+                    raise ValueError("ANTHROPIC_API_KEY 未设置")
+                ent = AI.add_manual_guidance(new, form["ticker"], form.get("label", "manual"),
+                                             form.get("date", today), form["text"])
+                if ent is None:
+                    raise ValueError("这段文字已经处理过")
+                new["status_board"] = status_board(new, datetime.now(timezone.utc).date())
+                msg = "已提取：" + ("找到指引" if ent["guidance_found"] else "未发现指引")
+            else:
+                raise ValueError("unknown action")
+            errs = validate_update(old, new)
+            if errs:
+                raise ValueError("; ".join(errs))
+            s.save(jid, new, "manual")
+            return _ai_page(jid, token, new, f"<p class='ok'>✓ {html.escape(msg)}</p>")
+        except Exception as ex:
+            return _ai_page(jid, token, old, f"<p class='err'>未保存：{html.escape(str(ex))}</p>")
 except ImportError:
-    router = None
+    router = Noness
