@@ -35,7 +35,7 @@ def _now_iso(now=None):
 
 
 # ---------------------------------------------------------------- API 客户端
-def claude_json(system, user, schema, max_tokens=4000):
+def claude_json(system, user, schema, max_tokens=16000):
     """调用 Claude，用结构化输出（output_config.format）保证返回符合 schema 的 JSON。
     注：Sonnet 5.5 不支持强制工具调用（tool_choice any/tool），所以用结构化输出。"""
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -48,6 +48,9 @@ def claude_json(system, user, schema, max_tokens=4000):
         "messages": [{"role": "user", "content": user}],
         "output_config": {"format": {"type": "json_schema", "schema": schema}},
     }
+    if model_name().startswith("claude-sonnet-5-5"):
+        # Sonnet 5.5 默认先做深度思考，会占用 max_tokens；这里的任务是提取和改写，不需要
+        body["thinking"] = {"type": "between_tools"}
     r = requests.post(API_URL, json=body, timeout=180, headers={
         "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
     if r.status_code != 200:
@@ -120,7 +123,7 @@ def translate_missing(doc, llm=None, now=None):
         return {"translated": [], "rejected": []}
     user = "Translate each item. Return one entry per key.\n\n" + json.dumps(
         [{"key": k, "zh": v} for k, v in todo.items()], ensure_ascii=False, indent=1)
-    out = llm(TRANSLATE_SYSTEM, user, TRANSLATE_SCHEMA, max_tokens=8000)
+    out = llm(TRANSLATE_SYSTEM, user, TRANSLATE_SCHEMA, max_tokens=16000)
     i18n = doc.setdefault("i18n", {})
     meta = doc.setdefault("i18n_meta", {})
     done, rejected = [], []
@@ -204,7 +207,7 @@ def extract_guidance(ticker, text, source, llm=None, now=None):
         return entry
     user = (f"Company: {ticker}\nDocument: {source.get('label', source.get('type'))} (date {source.get('date')})\n\n"
             f"Relevant excerpts:\n{window}")
-    out = llm(GUIDANCE_SYSTEM, user, GUIDANCE_SCHEMA, max_tokens=3000)
+    out = llm(GUIDANCE_SYSTEM, user, GUIDANCE_SCHEMA, max_tokens=16000)
     stmts = []
     for s in out.get("statements", []):
         if s.get("quote") and len(s["quote"].split()) > 40:
@@ -373,8 +376,8 @@ def review_context(old, new, triggers):
 
 
 def review_triggers(old, new, report):
-    t = []
-    if report.get("snapshot") == "appended":
+    t = list(new.get("review_pending_triggers") or [])   # 上次起草失败留下的
+    if report.get("snapshot") == "appended" and "new_snapshot" not in t:
         t.append("new_snapshot")
     ob = {k: v.get("status") for k, v in (old.get("status_board") or {}).items() if k != "as_of"}
     nb = {k: v.get("status") for k, v in (new.get("status_board") or {}).items() if k != "as_of"}
@@ -383,7 +386,8 @@ def review_triggers(old, new, report):
             t.append(f"status_change:{h}:{ob.get(h)}->{s}")
     if report.get("evaluated"):
         t.append("predictions_evaluated:" + ",".join(report["evaluated"]))
-    if any(e.get("guidance_found") for e in new.get("guidance_log", [])[len(old.get("guidance_log", [])):]):
+    if any(e.get("guidance_found") for e in new.get("guidance_log", [])[len(old.get("guidance_log", [])):]) \
+            and "new_guidance" not in t:
         t.append("new_guidance")
     return t
 
@@ -392,7 +396,7 @@ def draft_review(old, new, triggers, llm=None, now=None):
     llm = llm or claude_json
     ctx = review_context(old, new, triggers)
     out = llm(REVIEW_SYSTEM, "Context (JSON):\n" + json.dumps(ctx, ensure_ascii=False, indent=1),
-              REVIEW_SCHEMA, max_tokens=3000)
+              REVIEW_SCHEMA, max_tokens=16000)
     drafts = new.setdefault("review_drafts", [])
     d = {"id": f"D{len(drafts) + 1:03d}", "created_at": _now_iso(now), "triggers": triggers,
          "zh": out["zh"], "en": out["en"], "fr": out["fr"], "basis": out.get("basis", []),
