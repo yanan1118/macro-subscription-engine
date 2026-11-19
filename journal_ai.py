@@ -227,45 +227,89 @@ def list_earnings_releases(cik, since):
     return sorted(out, key=lambda x: x["filed"])
 
 
+EX99_NAME = re.compile(r"ex(hibit)?[-_.]?99", re.I)
+
+
+def find_ex99(index_html):
+    """从 SEC 文件索引页按官方文件类型找 EX-99.1；返回文件名或 None"""
+    best = None
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", index_html, re.S | re.I):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S | re.I)
+        typ = next((re.sub(r"<[^>]+>|\s", "", c) for c in cells if re.fullmatch(r"\s*EX-99[.\d]*\s*", re.sub(r"<[^>]+>", "", c))), None)
+        href = re.search(r'href="([^"]+\.html?)"', row, re.I)
+        if typ and href:
+            name = href.group(1).rsplit("/", 1)[-1]
+            if typ.upper() == "EX-99.1":
+                return name
+            best = best or name
+    return best
+
+
+def is_exhibit_url(url):
+    return bool(url) and bool(EX99_NAME.search(url.rsplit("/", 1)[-1]))
+
+
 def fetch_press_release(cik, accn, primary):
-    """优先取 EX-99.1（新闻稿），找不到就用主文档"""
+    """取 EX-99.1（新闻稿）。先看 SEC 索引页的文件类型，再按文件名，最后才用主文档"""
     from journal import _sec_get
     base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn.replace('-', '')}/"
+    name = None
     try:
-        items = _sec_get(base + "index.json").json()["directory"]["item"]
-        names = [i["name"] for i in items if re.search(r"\.html?$", i["name"], re.I)]
-        ex = [n for n in names if re.search(r"ex-?99", n, re.I)]
-        ex.sort(key=lambda n: (0 if re.search(r"99[-_.]?0?1\b|991", n) else 1, n))
-        name = ex[0] if ex else primary
+        name = find_ex99(_sec_get(base + f"{accn}-index.htm").text)
     except Exception:
-        name = primary
+        pass
+    if not name:
+        try:
+            items = _sec_get(base + "index.json").json()["directory"]["item"]
+            ex = sorted((i["name"] for i in items if re.search(r"\.html?$", i["name"], re.I) and EX99_NAME.search(i["name"])),
+                        key=lambda n: (0 if re.search(r"99[-_.]?0?1(?!\d)", n) else 1, n))
+            name = ex[0] if ex else None
+        except Exception:
+            pass
+    name = name or primary
     return base + name, html_to_text(_sec_get(base + name).text)
 
 
 def update_guidance(doc, companies, llm=None, list_releases=None, get_release=None, now=None):
-    """对每家公司处理新的业绩新闻稿；已处理过的（按 id）跳过"""
+    """对每家公司处理新的业绩新闻稿；已处理过的（按 id）跳过。
+    早期版本读错文件（读了 8-K 封面而非 EX-99.1）的记录会被标为 superseded 并重新提取。"""
     llm = llm or claude_json
     list_releases = list_releases or list_earnings_releases
     get_release = get_release or fetch_press_release
     log = doc.setdefault("guidance_log", [])
-    seen = {e["id"] for e in log}
-    added, errors = [], {}
+    by_id = {e["id"]: e for e in log}
+    added, superseded, errors = [], [], {}
     for ticker, cfg in companies.items():
         try:
             for rel in list_releases(cfg["cik"], GUIDANCE_START):
                 gid = f"{ticker}-{rel['accn']}"
-                if gid in seen:
+                old = by_id.get(gid)
+                if old is not None:
+                    redo = (old.get("status") != "superseded" and not is_exhibit_url(old.get("source", {}).get("url"))
+                            and f"{gid}-r2" not in by_id)
+                    if not redo:
+                        continue
+                    new_id = f"{gid}-r2"
+                else:
+                    new_id = gid
+                if new_id in by_id:
                     continue
                 url, text = get_release(cfg["cik"], rel["accn"], rel["primary"])
-                e = extract_guidance(ticker, text, {"id": gid, "type": "8-K EX-99", "accn": rel["accn"],
+                if old is not None and not is_exhibit_url(url):
+                    continue   # 重新取还是拿不到附件 → 保留原记录，不重复调用 API
+                e = extract_guidance(ticker, text, {"id": new_id, "type": "8-K EX-99", "accn": rel["accn"],
                                                     "date": rel["filed"], "url": url,
                                                     "label": "earnings press release"}, llm=llm, now=now)
+                if old is not None:
+                    old["status"] = "superseded"
+                    old["superseded_by"] = new_id
+                    superseded.append(gid)
                 log.append(e)
-                seen.add(gid)
-                added.append(gid)
+                by_id[new_id] = e
+                added.append(new_id)
         except Exception as ex:
             errors[ticker] = f"{type(ex).__name__}: {ex}"
-    return {"added": added, "errors": errors}
+    return {"added": added, "superseded": superseded, "errors": errors}
 
 
 def add_manual_guidance(doc, ticker, label, date_s, text, llm=None, now=None):
@@ -378,4 +422,4 @@ def reject_draft(doc, draft_id, today):
     if not d or d["status"] != "draft":
         raise ValueError("draft not found or already handled")
     d["status"] = "rejected"
-    d["rejected_at"] = todays
+    d["rejected_at"] = today
