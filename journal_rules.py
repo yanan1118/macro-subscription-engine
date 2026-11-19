@@ -64,9 +64,60 @@ def check_h3(doc, months=3, fred=None):
     return {"status": "triggered" if all_neg else "not_triggered", "detail": detail}
 
 
+QUALIFYING_REASONS = ("demand", "returns")
+CUT_THRESHOLD = -0.10
+
+
+def _guidance_points(doc):
+    """把 guidance_log 展开成按公司、时间排序的指引点"""
+    pts = []
+    for e in doc.get("guidance_log", []):
+        for s in e.get("statements", []):
+            lo, hi = s.get("low_usd_b"), s.get("high_usd_b")
+            mid = (lo + hi) / 2 if lo is not None and hi is not None else (lo if lo is not None else hi)
+            pts.append({"ticker": e["ticker"], "date": e["source"].get("date") or "", "entry": e["id"],
+                        "period": s.get("period_covered"), "basis": s.get("basis"), "mid": mid,
+                        "low": lo, "high": hi, "direction": s.get("direction_stated"),
+                        "reason": s.get("reason_category"), "status": e.get("status")})
+    return sorted(pts, key=lambda p: (p["ticker"], p["date"]))
+
+
 def check_h1(doc):
-    # CapEx 指引不在 XBRL 里，需要从财报新闻稿 / 电话会提取（后续用 Claude API 做）
-    return {"status": "manual", "detail": "guidance extraction not automated yet"}
+    """H1 证伪：≥2 家需求端公司连续 2 季下调各自口径 CapEx 指引，幅度 > 原指引中值 10%，原因为需求或回报。
+    比较对象：同一公司、同一指引期间、同一口径的上一次数值指引。"""
+    pts = _guidance_points(doc)
+    if not pts:
+        n = len(doc.get("guidance_log", []))
+        return {"status": "insufficient_data",
+                "detail": {"note": "no CapEx guidance extracted yet", "documents_checked": n}}
+    latest, cuts_by_co, review = {}, {}, []
+    for i, p in enumerate(pts):
+        prev = next((q for q in reversed(pts[:i]) if q["ticker"] == p["ticker"] and q["period"] == p["period"]
+                     and q["basis"] == p["basis"] and q["mid"] is not None and q["date"] < p["date"]), None)
+        chg = (p["mid"] / prev["mid"] - 1) if (prev and p["mid"] is not None and prev["mid"]) else None
+        p["change"] = chg
+        qualifying = chg is not None and chg <= CUT_THRESHOLD and p["reason"] in QUALIFYING_REASONS
+        if p["direction"] == "lowered" and chg is None:
+            review.append(f"{p['ticker']} {p['period']} ({p['date']}): lowered without comparable figure")
+        if p["direction"] == "lowered" and p["reason"] in ("not_stated", "other"):
+            review.append(f"{p['ticker']} {p['period']} ({p['date']}): lowered, reason unclear")
+        cuts_by_co.setdefault(p["ticker"], {})
+        # 每份文件（=每个季度）记一次：该季度是否有符合条件的下调
+        cuts_by_co[p["ticker"]][p["entry"]] = cuts_by_co[p["ticker"]].get(p["entry"], False) or qualifying
+        if p["mid"] is not None:
+            latest[p["ticker"]] = {k: p[k] for k in ("period", "basis", "low", "high", "change", "date", "status")}
+    consecutive = []
+    for t, by_entry in cuts_by_co.items():
+        seq = [by_entry[e] for e in sorted(by_entry, key=lambda e: next(q["date"] for q in pts if q["entry"] == e))]
+        if len(seq) >= 2 and seq[-1] and seq[-2]:
+            consecutive.append(t)
+    detail = {"latest": latest, "companies_with_2q_cuts": consecutive, "needs_review": review,
+              "pending_verification": sum(1 for e in doc.get("guidance_log", []) if e.get("status") == "pending")}
+    if len(consecutive) >= 2:
+        return {"status": "triggered", "detail": detail}
+    if review:
+        return {"status": "needs_review", "detail": detail}
+    return {"status": "not_triggered", "detail": detail}
 
 
 def status_board(doc, today, fred=None):
