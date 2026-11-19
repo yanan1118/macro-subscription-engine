@@ -205,8 +205,10 @@ def run_once(store, jid, now=None, **fetchers):
         if trig:
             try:
                 report["review_draft"] = AI.draft_review(old, draft, trig, llm=llm, now=now)["id"]
+                draft.pop("review_pending_triggers", None)
             except Exception as e:
-                report["review_draft"] = {"error": f"{type(e).__name__}: {e}"}
+                report["review_draft"] = {"error": f"{type(e).__name__}: {e}", "will_retry": True}
+                draft["review_pending_triggers"] = trig   # 下次运行重试
     else:
         report["ai"] = "disabled (ANTHROPIC_API_KEY not set)"
     errs = validate_update(old, draft)
