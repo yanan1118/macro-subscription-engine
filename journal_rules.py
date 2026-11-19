@@ -72,6 +72,8 @@ def _guidance_points(doc):
     """把 guidance_log 展开成按公司、时间排序的指引点"""
     pts = []
     for e in doc.get("guidance_log", []):
+        if e.get("status") == "superseded":   # 读错文件的旧记录不参与判定
+            continue
         for s in e.get("statements", []):
             lo, hi = s.get("low_usd_b"), s.get("high_usd_b")
             mid = (lo + hi) / 2 if lo is not None and hi is not None else (lo if lo is not None else hi)
@@ -87,7 +89,7 @@ def check_h1(doc):
     比较对象：同一公司、同一指引期间、同一口径的上一次数值指引。"""
     pts = _guidance_points(doc)
     if not pts:
-        n = len(doc.get("guidance_log", []))
+        n = sum(1 for e in doc.get("guidance_log", []) if e.get("status") != "superseded")
         return {"status": "insufficient_data",
                 "detail": {"note": "no CapEx guidance extracted yet", "documents_checked": n}}
     latest, cuts_by_co, review = {}, {}, []
