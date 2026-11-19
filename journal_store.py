@@ -131,7 +131,7 @@ def validate_update(old, new):
         if n[:len(o)] != o:
             errs.append(f"{key}: existing entries were modified or removed (append only)")
     og, ng = old.get("guidance_log", []), new.get("guidance_log", [])
-    strip = lambda e: {k: v for k, v in e.items() if k not in ("status", "verified_at")}
+    strip = lambda e: {k: v for k, v in e.items() if k not in ("status", "verified_at", "superseded_by")}
     if len(ng) < len(og) or [strip(e) for e in ng[:len(og)]] != [strip(e) for e in og]:
         errs.append("guidance_log: existing entries were modified or removed (append only)")
     _locked_leaves(old.get("baseline", {}), new.get("baseline", {}), "baseline", errs,
@@ -496,4 +496,4 @@ table{border-collapse:collapse;width:100%;font-size:12px}td,th{border-bottom:1px
         except Exception as ex:
             return _ai_page(jid, token, old, f"<p class='err'>未保存：{html.escape(str(ex))}</p>")
 except ImportError:
-    router = Noness
+    router = None
