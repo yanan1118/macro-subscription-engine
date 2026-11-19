@@ -26,6 +26,7 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from journal import build_journal_draft, verify_predictions
 from journal_rules import evaluate_due_predictions, status_board
 import journal_ai as AI
+import journal_notify as N
 from journal import DEMAND
 
 LANGS = ("zh", "en", "fr")
@@ -43,6 +44,12 @@ versions_t = Table("journal_versions", _meta,      # 每次有实质变化都存
                    Column("doc", _BIG, nullable=False),
                    Column("saved_at", String(32), nullable=False),
                    Column("source", String(32), nullable=False))
+
+
+notify_t = Table("journal_notify", _meta,          # 已发送的提醒（用于去重，不属于 Journal 内容）
+                 Column("jid", String(32), primary_key=True),
+                 Column("key", String(191), primary_key=True),
+                 Column("sent_at", String(32), nullable=False))
 
 
 def _db_url():
@@ -65,6 +72,22 @@ class Store:
     def list_ids(self):
         with self.engine.connect() as c:
             return [r[0] for r in c.execute(select(docs_t.c.jid).order_by(docs_t.c.jid))]
+
+    def notified(self, jid, key, within_days=None):
+        with self.engine.connect() as c:
+            row = c.execute(select(notify_t.c.sent_at).where(notify_t.c.jid == jid, notify_t.c.key == key)).first()
+        if not row:
+            return False
+        if within_days is None:
+            return True
+        sent = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - sent).days < within_days
+
+    def mark_notified(self, jid, key):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.engine.begin() as c:
+            c.execute(notify_t.delete().where(notify_t.c.jid == jid, notify_t.c.key == key))
+            c.execute(notify_t.insert().values(jid=jid, key=key, sent_at=now))
 
     def save(self, jid, doc, source, version=True):
         s = json.dumps(doc, ensure_ascii=False)
@@ -215,13 +238,25 @@ def run_once(store, jid, now=None, **fetchers):
     if errs:   # 程序自己的改动也要过守卫；不通过就不保存
         report["saved"] = False
         report["guard_errors"] = errs
+        _notify(store, jid, old, old, report, today, fetchers.get("send_email"))
         return report
     changed = _material(old) != _material(draft)
     store.save(jid, draft, "auto", version=changed)
     report["saved"] = True
     report["new_version"] = changed
     report["status_board"] = board
+    _notify(store, jid, old, draft, report, today, fetchers.get("send_email"))
     return report
+
+
+def _notify(store, jid, old, new, report, today, send=None):
+    if not (send or N.notify_enabled()):
+        report["notify"] = "disabled (RESEND_API_KEY / NOTIFY_EMAIL_TO not set)"
+        return
+    try:
+        report["notify"] = N.notify(store, jid, old, new, report, today=today, send=send)
+    except Exception as e:
+        report["notify"] = {"error": f"{type(e).__name__}: {e}"}
 
 
 _LAST = {"reports": {}, "ran_at": None}
@@ -337,6 +372,18 @@ try:
         _check_token(token)
         _need_store()
         return _locked_run_all()
+
+    @router.get("/admin/journal/test-email")
+    def journal_test_email(token: str = ""):
+        _check_token(token)
+        if not N.notify_enabled():
+            raise HTTPException(status_code=500, detail="RESEND_API_KEY / NOTIFY_EMAIL_TO not set")
+        try:
+            mid = N.send_resend("[Minerva Journal] 测试邮件 / Test email",
+                                "<p>Journal 邮件提醒设置成功。以后有待处理事项时会发到这个邮箱。</p>")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return {"sent": True, "id": mid, "to": os.environ.get("NOTIFY_EMAIL_TO")}
 
     @router.get("/admin/journal/status")
     def journal_status(token: str = ""):
